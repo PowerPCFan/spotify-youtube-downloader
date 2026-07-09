@@ -429,6 +429,12 @@ pending_downloads: dict[int, dict[str, Any]] = {}
 pending_lock = threading.Lock()
 
 
+class DownloadJob(TypedDict):
+    youtube_url: str
+    display_name: str
+    track: SeenSpotifyTrack | None
+
+
 @bot.event
 async def on_ready() -> None:
     print(f"Bot logged in as {bot.user}")
@@ -439,23 +445,33 @@ async def on_message(message: Message) -> None:
     if message.author == bot.user:
         return
 
-    server_obj = bot.get_guild(int(SERVER_ID))
-    channel_obj: TextChannel = server_obj.get_channel(int(CHANNEL_ID))  # type: ignore
-
-    if message.channel == channel_obj and message.reference and message.reference.message_id in pending_downloads:
+    if message.reference and message.reference.message_id in pending_downloads:
         await handle_user_reply(message, message.reference.message_id)
 
     await bot.process_commands(message)
 
 
-def send_download_options(
-    track: SeenSpotifyTrack,
-    results: list[dict[str, Any]],
-) -> str | None:
-    channel: TextChannel = bot.get_guild(int(SERVER_ID)).get_channel(int(CHANNEL_ID))  # type: ignore
+def get_default_channel() -> TextChannel | None:
+    try:
+        guild = bot.get_guild(int(SERVER_ID))
+        if guild is None:
+            return None
+        channel = guild.get_channel(int(CHANNEL_ID))
+        return channel if isinstance(channel, TextChannel) else None
+    except Exception:
+        return None
 
-    spotify_duration = format_duration(track.item.duration_ms)
-    prompt = f"{PING} Found {len(results)} matches for *{track.item.name}* by {track.item.artists[0].name} (Spotify: {spotify_duration}):\n\n"  # noqa: E501
+
+def is_youtube_url(value: str) -> bool:
+    return "youtube.com/watch?v=" in value or "youtu.be/" in value
+
+
+def build_download_picker_prompt(
+    intro_line: str,
+    results: list[dict[str, Any]],
+    spotify_duration_ms: int | None = None,
+) -> str:
+    prompt = f"{intro_line}\n\n"
     for i, result in enumerate(results, 1):
         title = html.unescape(result["title"])
         title = title[:100] if len(title) > 100 else title
@@ -469,21 +485,31 @@ def send_download_options(
             channel_line += f" ({subs} Subscribers)"
 
         duration_line = ""
-        if duration_ms:
+        if duration_ms is not None:
             yt_duration = format_duration(duration_ms)
-            diff_ms = duration_ms - track.item.duration_ms
-            if diff_ms > 0:
-                diff_formatted = format_duration(diff_ms)
-                duration_line = f"\n   - Song Length: {yt_duration} (+{diff_formatted} longer than Spotify)"
-            elif diff_ms < 0:
-                diff_formatted = format_duration(abs(diff_ms))
-                duration_line = f"\n   - Song Length: {yt_duration} (-{diff_formatted} shorter than Spotify)"
+            if spotify_duration_ms is None:
+                duration_line = f"\n   - Song Length: {yt_duration}"
             else:
-                duration_line = f"\n   - Song Length: {yt_duration} (Same length as Spotify)"
+                diff_ms = duration_ms - spotify_duration_ms
+                if diff_ms > 0:
+                    diff_formatted = format_duration(diff_ms)
+                    duration_line = f"\n   - Song Length: {yt_duration} (+{diff_formatted} longer than Spotify)"
+                elif diff_ms < 0:
+                    diff_formatted = format_duration(abs(diff_ms))
+                    duration_line = f"\n   - Song Length: {yt_duration} (-{diff_formatted} shorter than Spotify)"
+                else:
+                    duration_line = f"\n   - Song Length: {yt_duration} (Same length as Spotify)"
 
-        prompt += f"{i}. [{title}](<{result["url"]}>)\n{channel_line}{duration_line}\n"
+        prompt += f"{i}. [{title}](<{result['url']}>)\n{channel_line}{duration_line}\n"
     prompt += "Reply with the best option or a YouTube URL:"
+    return prompt
 
+
+def send_picker_and_wait(
+    channel: TextChannel,
+    prompt: str,
+    results: list[dict[str, Any]],
+) -> str | None:
     selected_url_ref: list[str | None] = [None]
     message_id: int | None = None
 
@@ -494,7 +520,6 @@ def send_download_options(
             message_id = msg.id
             with pending_lock:
                 pending_downloads[message_id] = {
-                    "track": track,
                     "results": results,
                     "channel": channel,
                     "selected_url_ref": selected_url_ref,
@@ -520,12 +545,8 @@ def send_download_options(
         if time.time() - start_time > timeout:
             print("Timeout waiting for user selection")
             with pending_lock:
-                to_remove = [
-                    mid for mid, data in pending_downloads.items()
-                    if data["track"] is track
-                ]
-                for mid in to_remove:
-                    del pending_downloads[mid]
+                if message_id is not None and message_id in pending_downloads:
+                    del pending_downloads[message_id]
             return None
 
     selected = selected_url_ref[0]
@@ -533,6 +554,41 @@ def send_download_options(
         if message_id is not None and message_id in pending_downloads:
             del pending_downloads[message_id]
     return selected
+
+
+def send_download_options(
+    track: SeenSpotifyTrack,
+    results: list[dict[str, Any]],
+) -> str | None:
+    channel = get_default_channel()
+    if channel is None:
+        return None
+
+    spotify_duration = format_duration(track.item.duration_ms)
+    intro = (
+        f"{PING} Found {len(results)} matches for *{track.item.name}* by "
+        f"{track.item.artists[0].name} (Spotify: {spotify_duration}):"
+    )
+    prompt = build_download_picker_prompt(
+        intro,
+        results,
+        spotify_duration_ms=track.item.duration_ms,
+    )
+    return send_picker_and_wait(channel, prompt, results)
+
+
+def queue_download_job(
+    youtube_url: str,
+    display_name: str,
+    track: SeenSpotifyTrack | None = None,
+) -> None:
+    with download_lock:
+        download_queue.append({
+            "youtube_url": youtube_url,
+            "display_name": display_name,
+            "track": track,
+        })
+        download_event.set()
 
 
 async def handle_user_reply(message: Message, prompt_message_id: int) -> None:
@@ -559,7 +615,7 @@ async def handle_user_reply(message: Message, prompt_message_id: int) -> None:
                 pending_downloads[prompt_message_id] = data
     except ValueError:
         url = message.content.strip()
-        if "youtube.com/watch?v=" in url or "youtu.be/" in url:
+        if is_youtube_url(url):
             print(f"[{time.strftime('%H:%M:%S')}] User selected custom URL: {url}")
             selected_url_ref[0] = url
             await message.reply("Selected custom URL, download starting!")
@@ -568,6 +624,52 @@ async def handle_user_reply(message: Message, prompt_message_id: int) -> None:
             selected_url_ref[0] = None
             with pending_lock:
                 pending_downloads[prompt_message_id] = data
+
+
+@bot.command(name="download")
+async def download_command(ctx: commands.Context[commands.Bot], *, query_or_url: str = "") -> None:
+    query_or_url = query_or_url.strip()
+    if not query_or_url:
+        await ctx.reply("Usage: `.download <YouTube query or URL>`")
+        return
+
+    if is_youtube_url(query_or_url):
+        queue_download_job(
+            youtube_url=query_or_url,
+            display_name=f"manual URL <{query_or_url}>",
+            track=None,
+        )
+        await ctx.reply(f"Queued direct download from <{query_or_url}>.")
+        return
+
+    if not isinstance(ctx.channel, TextChannel):
+        await ctx.reply("This command only works in a server text channel.")
+        return
+
+    await ctx.reply(f"Searching YouTube for: *{query_or_url}*")
+    results = await asyncio.to_thread(search_youtube, query_or_url, 8)
+    if not results:
+        await ctx.reply("No YouTube results found for that query.")
+        return
+
+    intro = f"{PING} Found {len(results)} matches for *{query_or_url}*:"
+    prompt = build_download_picker_prompt(intro, results)
+    selected_url = await asyncio.to_thread(send_picker_and_wait, ctx.channel, prompt, results)
+    if selected_url is None:
+        await ctx.reply("No selection was made in time.")
+        return
+
+    selected_result = next((item for item in results if item["url"] == selected_url), None)
+    display_name = (
+        f"*{html.unescape(selected_result['title'])}*"
+        if selected_result is not None
+        else f"manual query: *{query_or_url}*"
+    )
+    queue_download_job(
+        youtube_url=selected_url,
+        display_name=display_name,
+        track=None,
+    )
 
 
 def run_bot() -> None:
@@ -593,7 +695,7 @@ youtube = googleapiclient.discovery.build(
 
 def make_youtube_query(track: SeenSpotifyTrack) -> str:
     artists = track.item.artists[:3] if len(track.item.artists) > 3 else track.item.artists
-    return f"{track.item.name} {", ".join(a.name for a in artists)} song"
+    return f"{track.item.name} {', '.join(a.name for a in artists)} song"
 
 
 def format_subscribers(count: int) -> str:
@@ -682,7 +784,7 @@ pending_selection_queue: list[tuple[SeenSpotifyTrack, str]] = []
 pending_selection_lock = threading.Lock()
 pending_selection_event = threading.Event()
 
-download_queue: list[tuple[SeenSpotifyTrack, str]] = []
+download_queue: list[DownloadJob] = []
 download_lock = threading.Lock()
 download_event = threading.Event()
 in_flight_track_ids: set[str] = set()
@@ -718,10 +820,10 @@ def save_to_downloaded_json(track: SeenSpotifyTrack) -> None:
         json.dump(data, f, indent=4)
 
 
-def download_track(track: SeenSpotifyTrack, youtube_url: str, max_retries: int = 3) -> bool:
+def download_track(youtube_url: str, display_name: str, max_retries: int = 3) -> bool:
     for attempt in range(max_retries):
         try:
-            print(f"[{time.strftime('%H:%M:%S')}] Downloading: {track.item.name} by {track.item.artists[0].name}")
+            print(f"[{time.strftime('%H:%M:%S')}] Downloading: {display_name}")
             yt_dlp.YoutubeDL({
                 "outtmpl": str(DOWNLOADS.resolve() / "%(title)s.%(ext)s"),
                 "format": "bestaudio[ext=opus]/bestaudio/best",
@@ -730,7 +832,7 @@ def download_track(track: SeenSpotifyTrack, youtube_url: str, max_retries: int =
                     "preferredcodec": "opus",
                 }],
             }).download([youtube_url])
-            print(f"[{time.strftime('%H:%M:%S')}] Downloaded: {track.item.name} by {track.item.artists[0].name}")
+            print(f"[{time.strftime('%H:%M:%S')}] Downloaded: {display_name}")
             return True
         except Exception as e:
             error_msg = str(e)
@@ -781,9 +883,11 @@ def pending_selection_worker() -> None:
 
         print(f"[{time.strftime('%H:%M:%S')}] User selected: {selected_url}")
 
-        with download_lock:
-            download_queue.append((track, selected_url))
-            download_event.set()
+        queue_download_job(
+            youtube_url=selected_url,
+            display_name=f"*{track.item.name}* by {track.item.artists[0].name}",
+            track=track,
+        )
 
         with download_lock:
             seen_tracks[:] = [(t, q) for t, q in seen_tracks if t is not track]
@@ -806,36 +910,41 @@ def download_worker() -> None:
             with download_lock:
                 if not download_queue:
                     continue
-                track, youtube_url = download_queue.pop(0)
+                job = download_queue.pop(0)
 
-            guild = bot.get_guild(int(SERVER_ID))
-            channel: TextChannel = guild.get_channel(int(CHANNEL_ID))  # type: ignore
+            youtube_url = job["youtube_url"]
+            display_name = job["display_name"]
+            track = job["track"]
+
+            channel = get_default_channel()
 
             if channel:
                 asyncio.run_coroutine_threadsafe(
-                    send_download_status(channel, f"⬇️ Downloading *{track.item.name}* by {track.item.artists[0].name}..."),  # noqa: E501
+                    send_download_status(channel, f"⬇️ Downloading {display_name}..."),
                     bot.loop,
                 )
 
-            success = download_track(track, youtube_url)
+            success = download_track(youtube_url, display_name)
 
             if channel:
                 if success:
-                    save_to_downloaded_json(track)
+                    if track is not None:
+                        save_to_downloaded_json(track)
                     asyncio.run_coroutine_threadsafe(
-                        send_download_status(channel, f"✅ Downloaded *{track.item.name}* by {track.item.artists[0].name}!"),  # noqa: E501
+                        send_download_status(channel, f"✅ Downloaded {display_name}!"),
                         bot.loop,
                     )
                 else:
                     asyncio.run_coroutine_threadsafe(
-                        send_download_status(channel, f"❌ Failed to download *{track.item.name}* by {track.item.artists[0].name}"),  # noqa: E501
+                        send_download_status(channel, f"❌ Failed to download {display_name}"),
                         bot.loop,
                     )
             else:  # noqa: PLR5501
                 if success:
-                    save_to_downloaded_json(track)
+                    if track is not None:
+                        save_to_downloaded_json(track)
                 else:
-                    print(f"[{time.strftime('%H:%M:%S')}] Failed to download: {track.item.name}")
+                    print(f"[{time.strftime('%H:%M:%S')}] Failed to download: {display_name}")
         except Exception as e:
             print(f"[{time.strftime('%H:%M:%S')}] Download worker error: {e}")
             traceback.print_exc()
