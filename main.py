@@ -482,7 +482,7 @@ def send_download_options(
                 duration_line = f"\n   - Song Length: {yt_duration} (Same length as Spotify)"
 
         prompt += f"{i}. [{title}](<{result["url"]}>)\n{channel_line}{duration_line}\n"
-    prompt += "Reply with the best option:"
+    prompt += "Reply with the best option or a YouTube URL:"
 
     selected_url_ref: list[str | None] = [None]
     message_id: int | None = None
@@ -553,15 +553,21 @@ async def handle_user_reply(message: Message, prompt_message_id: int) -> None:
             # Acknowledge the selection
             await message.reply(f"Selected *{selected['title']}*, download starting!")
         else:
-            await message.reply("Invalid choice. Please reply with a number between 1 and 10.")
+            await message.reply("Invalid choice. Please reply with a number between 1 and 8, or paste a YouTube URL.")
             selected_url_ref[0] = None
             with pending_lock:
                 pending_downloads[prompt_message_id] = data
     except ValueError:
-        await message.reply("Invalid input. Please reply with a number.")
-        selected_url_ref[0] = None
-        with pending_lock:
-            pending_downloads[prompt_message_id] = data
+        url = message.content.strip()
+        if "youtube.com/watch?v=" in url or "youtu.be/" in url:
+            print(f"[{time.strftime('%H:%M:%S')}] User selected custom URL: {url}")
+            selected_url_ref[0] = url
+            await message.reply("Selected custom URL, download starting!")
+        else:
+            await message.reply("Invalid input. Please reply with the number of the item you'd like to select, or paste a YouTube URL.")  # noqa: E501
+            selected_url_ref[0] = None
+            with pending_lock:
+                pending_downloads[prompt_message_id] = data
 
 
 def run_bot() -> None:
@@ -712,18 +718,29 @@ def save_to_downloaded_json(track: SeenSpotifyTrack) -> None:
         json.dump(data, f, indent=4)
 
 
-def download_track(track: SeenSpotifyTrack, youtube_url: str) -> bool:
-    print(f"[{time.strftime('%H:%M:%S')}] Downloading: {track.item.name} by {track.item.artists[0].name}")
-    yt_dlp.YoutubeDL({
-        "outtmpl": str(DOWNLOADS.resolve() / "%(title)s.%(ext)s"),
-        "format": "bestaudio[ext=opus]/bestaudio/best",
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "opus",
-        }],
-    }).download([youtube_url])
-    print(f"[{time.strftime('%H:%M:%S')}] Downloaded: {track.item.name} by {track.item.artists[0].name}")
-    return True
+def download_track(track: SeenSpotifyTrack, youtube_url: str, max_retries: int = 3) -> bool:
+    for attempt in range(max_retries):
+        try:
+            print(f"[{time.strftime('%H:%M:%S')}] Downloading: {track.item.name} by {track.item.artists[0].name}")
+            yt_dlp.YoutubeDL({
+                "outtmpl": str(DOWNLOADS.resolve() / "%(title)s.%(ext)s"),
+                "format": "bestaudio[ext=opus]/bestaudio/best",
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "opus",
+                }],
+            }).download([youtube_url])
+            print(f"[{time.strftime('%H:%M:%S')}] Downloaded: {track.item.name} by {track.item.artists[0].name}")
+            return True
+        except Exception as e:
+            error_msg = str(e)
+            if "403" in error_msg or "Forbidden" in error_msg:  # noqa: SIM102
+                if attempt < max_retries - 1:
+                    print(f"[{time.strftime('%H:%M:%S')}] 403 Forbidden error, retrying in 60 seconds (attempt {attempt + 1}/{max_retries})")  # noqa: E501
+                    time.sleep(60)
+                    continue
+            break
+    return False
 
 
 def pending_selection_worker() -> None:
@@ -773,22 +790,56 @@ def pending_selection_worker() -> None:
             in_flight_track_ids.discard(track.item.id)
 
 
+async def send_download_status(channel: TextChannel, message: str) -> None:
+    try:
+        await channel.send(message)
+    except Exception as e:
+        print(f"[ERROR] Failed to send status message: {e}")
+
+
 def download_worker() -> None:
     while True:
-        download_event.wait()
-        download_event.clear()
+        try:
+            download_event.wait()
+            download_event.clear()
 
-        with download_lock:
-            if not download_queue:
-                continue
-            track, youtube_url = download_queue.pop(0)
+            with download_lock:
+                if not download_queue:
+                    continue
+                track, youtube_url = download_queue.pop(0)
 
-        success = download_track(track, youtube_url)
+            guild = bot.get_guild(int(SERVER_ID))
+            channel: TextChannel = guild.get_channel(int(CHANNEL_ID))  # type: ignore
 
-        if success:
-            save_to_downloaded_json(track)
-        else:
-            print(f"[{time.strftime('%H:%M:%S')}] Failed to download: {track.item.name}")
+            if channel:
+                asyncio.run_coroutine_threadsafe(
+                    send_download_status(channel, f"⬇️ Downloading *{track.item.name}* by {track.item.artists[0].name}..."),  # noqa: E501
+                    bot.loop,
+                )
+
+            success = download_track(track, youtube_url)
+
+            if channel:
+                if success:
+                    save_to_downloaded_json(track)
+                    asyncio.run_coroutine_threadsafe(
+                        send_download_status(channel, f"✅ Downloaded *{track.item.name}* by {track.item.artists[0].name}!"),  # noqa: E501
+                        bot.loop,
+                    )
+                else:
+                    asyncio.run_coroutine_threadsafe(
+                        send_download_status(channel, f"❌ Failed to download *{track.item.name}* by {track.item.artists[0].name}"),  # noqa: E501
+                        bot.loop,
+                    )
+            else:  # noqa: PLR5501
+                if success:
+                    save_to_downloaded_json(track)
+                else:
+                    print(f"[{time.strftime('%H:%M:%S')}] Failed to download: {track.item.name}")
+        except Exception as e:
+            print(f"[{time.strftime('%H:%M:%S')}] Download worker error: {e}")
+            traceback.print_exc()
+            time.sleep(1)
 
 
 def queue_download(track: SeenSpotifyTrack, youtube_query: str) -> None:
