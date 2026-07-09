@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import os
 import threading
@@ -453,7 +454,7 @@ def send_download_options(
 
     prompt = f"{PING} Found {len(results)} matches for *{track.item.name}* by {track.item.artists[0].name}:\n\n"
     for i, result in enumerate(results, 1):
-        title = result["title"]
+        title = html.unescape(result["title"])
         title = title[:100] if len(title) > 100 else title  # noqa: PLR2004
         prompt += f"{i}. [{title}](<{result["url"]}>)\n"
     prompt += "Reply with the best option:"
