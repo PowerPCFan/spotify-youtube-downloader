@@ -1,4 +1,4 @@
-# ruff: noqa: PLR0913, PLR0917
+# ruff: noqa: PLR0913, PLR0917, C901, PLR0914, PLR0915, PLW0717, PLR2004, RUF029, PGH003
 
 from __future__ import annotations
 
@@ -6,8 +6,10 @@ import asyncio
 import html
 import json
 import os
+import re
 import threading
 import time
+import traceback
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NotRequired, Self, TypedDict
@@ -428,7 +430,7 @@ pending_lock = threading.Lock()
 
 
 @bot.event
-async def on_ready() -> None:  # noqa: RUF029
+async def on_ready() -> None:
     print(f"Bot logged in as {bot.user}")
 
 
@@ -438,7 +440,7 @@ async def on_message(message: Message) -> None:
         return
 
     server_obj = bot.get_guild(int(SERVER_ID))
-    channel_obj: TextChannel = server_obj.get_channel(int(CHANNEL_ID))  # type: ignore  # noqa: PGH003
+    channel_obj: TextChannel = server_obj.get_channel(int(CHANNEL_ID))  # type: ignore
 
     if message.channel == channel_obj and message.reference and message.reference.message_id in pending_downloads:
         await handle_user_reply(message, message.reference.message_id)
@@ -450,19 +452,36 @@ def send_download_options(
     track: SeenSpotifyTrack,
     results: list[dict[str, Any]],
 ) -> str | None:
-    channel: TextChannel = bot.get_guild(int(SERVER_ID)).get_channel(int(CHANNEL_ID))  # type: ignore  # noqa: PGH003
+    channel: TextChannel = bot.get_guild(int(SERVER_ID)).get_channel(int(CHANNEL_ID))  # type: ignore
 
-    prompt = f"{PING} Found {len(results)} matches for *{track.item.name}* by {track.item.artists[0].name}:\n\n"
+    spotify_duration = format_duration(track.item.duration_ms)
+    prompt = f"{PING} Found {len(results)} matches for *{track.item.name}* by {track.item.artists[0].name} (Spotify: {spotify_duration}):\n\n"  # noqa: E501
     for i, result in enumerate(results, 1):
         title = html.unescape(result["title"])
-        title = title[:100] if len(title) > 100 else title  # noqa: PLR2004
+        title = title[:100] if len(title) > 100 else title
         channel_name = result["channel"]
         channel_info = result.get("channel_info")
+        duration_ms = result.get("duration_ms")
+
+        channel_line = f"   - Channel: {channel_name}"
         if channel_info:
             subs = format_subscribers(channel_info["subscriber_count"])
-            prompt += f"{i}. [{title}](<{result["url"]}>)\n   - Channel: {channel_name} ({subs} Subscribers)\n"
-        else:
-            prompt += f"{i}. [{title}](<{result["url"]}>)\n"
+            channel_line += f" ({subs} Subscribers)"
+
+        duration_line = ""
+        if duration_ms:
+            yt_duration = format_duration(duration_ms)
+            diff_ms = duration_ms - track.item.duration_ms
+            if diff_ms > 0:
+                diff_formatted = format_duration(diff_ms)
+                duration_line = f"\n   - Song Length: {yt_duration} (+{diff_formatted} longer than Spotify)"
+            elif diff_ms < 0:
+                diff_formatted = format_duration(abs(diff_ms))
+                duration_line = f"\n   - Song Length: {yt_duration} (-{diff_formatted} shorter than Spotify)"
+            else:
+                duration_line = f"\n   - Song Length: {yt_duration} (Same length as Spotify)"
+
+        prompt += f"{i}. [{title}](<{result["url"]}>)\n{channel_line}{duration_line}\n"
     prompt += "Reply with the best option:"
 
     selected_url_ref: list[str | None] = [None]
@@ -470,20 +489,27 @@ def send_download_options(
 
     async def send_and_track() -> None:
         nonlocal message_id
-        msg = await channel.send(prompt)
-        message_id = msg.id
-        with pending_lock:
-            pending_downloads[message_id] = {
-                "track": track,
-                "results": results,
-                "channel": channel,
-                "selected_url_ref": selected_url_ref,
-            }
+        try:
+            msg = await asyncio.wait_for(channel.send(prompt), timeout=10.0)
+            message_id = msg.id
+            with pending_lock:
+                pending_downloads[message_id] = {
+                    "track": track,
+                    "results": results,
+                    "channel": channel,
+                    "selected_url_ref": selected_url_ref,
+                }
+        except TimeoutError:
+            print("[ERROR] Message send timed out after 10 seconds")
+        except Exception as e:
+            print(f"[ERROR] Error sending message: {e}")
+            traceback.print_exc()
 
     try:
         asyncio.run_coroutine_threadsafe(send_and_track(), bot.loop)
     except Exception as e:
-        print(f"Error sending download options: {e}")
+        print(f"[ERROR] Error sending download options: {e}")
+        traceback.print_exc()
         return None
 
     timeout = 60 * 15
@@ -518,7 +544,7 @@ async def handle_user_reply(message: Message, prompt_message_id: int) -> None:
         results = data["results"]
         selected_url_ref = data["selected_url_ref"]
 
-    try:  # noqa: PLW0717
+    try:
         choice = int(message.content.strip())
         if 1 <= choice <= len(results):
             selected = results[choice - 1]
@@ -560,26 +586,33 @@ youtube = googleapiclient.discovery.build(
 
 
 def make_youtube_query(track: SeenSpotifyTrack) -> str:
-    artists = track.item.artists[:3] if len(track.item.artists) > 3 else track.item.artists  # noqa: PLR2004
+    artists = track.item.artists[:3] if len(track.item.artists) > 3 else track.item.artists
     return f"{track.item.name} {", ".join(a.name for a in artists)} song"
 
 
 def format_subscribers(count: int) -> str:
-    if count >= 1_000_000:  # noqa: PLR2004
+    if count >= 1_000_000:
         millions = count / 1_000_000
-        if millions >= 100:  # noqa: PLR2004
+        if millions >= 100:
             return f"{int(millions)}M"
         return f"{millions:.2f}M"
-    elif count >= 1_000:  # noqa: PLR2004
+    elif count >= 1_000:
         thousands = count / 1_000
-        if thousands >= 100:  # noqa: PLR2004
+        if thousands >= 100:
             return f"{int(thousands)}K"
         return f"{thousands:.2f}K"
     return str(count)
 
 
-def search_youtube(query: str, max_results: int = 10) -> list[dict[str, Any]]:
-    try:  # noqa: PLW0717
+def format_duration(ms: int) -> str:
+    total_seconds = ms // 1000
+    minutes = total_seconds // 60
+    seconds = total_seconds % 60
+    return f"{minutes}:{seconds:02d}"
+
+
+def search_youtube(query: str, max_results: int) -> list[dict[str, Any]]:
+    try:
         request = youtube.search().list(
             q=query,
             part="id,snippet",
@@ -603,6 +636,25 @@ def search_youtube(query: str, max_results: int = 10) -> list[dict[str, Any]]:
                     "subscriber_count": int(channel["statistics"].get("subscriberCount", "0")),
                 }
 
+        video_ids = [item["id"]["videoId"] for item in response.get("items", [])]
+        video_duration_info = {}
+        if video_ids:
+            video_request = youtube.videos().list(
+                part="contentDetails",
+                id=",".join(video_ids),
+            )
+            video_response = video_request.execute()
+            for video in video_response.get("items", []):
+                duration_str = video["contentDetails"]["duration"]
+                pattern = re.compile(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?")
+                match = pattern.match(duration_str)
+                if match:
+                    hours = int(match.group(1) or 0)
+                    minutes = int(match.group(2) or 0)
+                    seconds = int(match.group(3) or 0)
+                    total_ms = ((hours * 60 + minutes) * 60 + seconds) * 1000
+                    video_duration_info[video["id"]] = total_ms
+
         return [
             {
                 "id": item["id"]["videoId"],
@@ -611,6 +663,7 @@ def search_youtube(query: str, max_results: int = 10) -> list[dict[str, Any]]:
                 "channel_id": item["snippet"]["channelId"],
                 "url": f"https://youtube.com/watch?v={item['id']['videoId']}",
                 "channel_info": channel_info.get(item["snippet"]["channelId"]),
+                "duration_ms": video_duration_info.get(item["id"]["videoId"]),
             }
             for item in response.get("items", [])
         ]
@@ -691,7 +744,7 @@ def pending_selection_worker() -> None:
             continue
 
         print(f"[{time.strftime('%H:%M:%S')}] Searching YouTube for: {youtube_query}")
-        results = search_youtube(youtube_query, max_results=10)
+        results = search_youtube(youtube_query, max_results=8)
         if not results:
             print(f"[{time.strftime('%H:%M:%S')}] No YouTube results found for: {track.item.name}")
             with download_lock:
