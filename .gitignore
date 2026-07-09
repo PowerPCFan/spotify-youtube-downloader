@@ -4,3 +4,4 @@ __pycache__/
 .env
 spotify-cache.json
 downloads/
+downloaded.json
