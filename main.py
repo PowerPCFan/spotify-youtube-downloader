@@ -456,7 +456,13 @@ def send_download_options(
     for i, result in enumerate(results, 1):
         title = html.unescape(result["title"])
         title = title[:100] if len(title) > 100 else title  # noqa: PLR2004
-        prompt += f"{i}. [{title}](<{result["url"]}>)\n"
+        channel_name = result["channel"]
+        channel_info = result.get("channel_info")
+        if channel_info:
+            subs = format_subscribers(channel_info["subscriber_count"])
+            prompt += f"{i}. [{title}](<{result["url"]}>)\n   - Channel: {channel_name} ({subs} Subscribers)\n"
+        else:
+            prompt += f"{i}. [{title}](<{result["url"]}>)\n"
     prompt += "Reply with the best option:"
 
     selected_url_ref: list[str | None] = [None]
@@ -558,8 +564,22 @@ def make_youtube_query(track: SeenSpotifyTrack) -> str:
     return f"{track.item.name} {", ".join(a.name for a in artists)} song"
 
 
+def format_subscribers(count: int) -> str:
+    if count >= 1_000_000:  # noqa: PLR2004
+        millions = count / 1_000_000
+        if millions >= 100:  # noqa: PLR2004
+            return f"{int(millions)}M"
+        return f"{millions:.2f}M"
+    elif count >= 1_000:  # noqa: PLR2004
+        thousands = count / 1_000
+        if thousands >= 100:  # noqa: PLR2004
+            return f"{int(thousands)}K"
+        return f"{thousands:.2f}K"
+    return str(count)
+
+
 def search_youtube(query: str, max_results: int = 10) -> list[dict[str, Any]]:
-    try:
+    try:  # noqa: PLW0717
         request = youtube.search().list(
             q=query,
             part="id,snippet",
@@ -568,12 +588,29 @@ def search_youtube(query: str, max_results: int = 10) -> list[dict[str, Any]]:
         )
         response = request.execute()
 
+        channel_ids = list({item["snippet"]["channelId"] for item in response.get("items", [])})
+
+        channel_info = {}
+        if channel_ids:
+            channel_request = youtube.channels().list(
+                part="snippet,statistics",
+                id=",".join(channel_ids),
+            )
+            channel_response = channel_request.execute()
+            for channel in channel_response.get("items", []):
+                channel_info[channel["id"]] = {
+                    "title": channel["snippet"]["title"],
+                    "subscriber_count": int(channel["statistics"].get("subscriberCount", "0")),
+                }
+
         return [
             {
                 "id": item["id"]["videoId"],
                 "title": item["snippet"]["title"],
                 "channel": item["snippet"]["channelTitle"],
+                "channel_id": item["snippet"]["channelId"],
                 "url": f"https://youtube.com/watch?v={item['id']['videoId']}",
+                "channel_info": channel_info.get(item["snippet"]["channelId"]),
             }
             for item in response.get("items", [])
         ]
