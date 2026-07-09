@@ -1,8 +1,10 @@
-# ruff: noqa: PLR0913, PLR0917, C901, PLR0914, PLR0915, PLW0717, PLR2004, RUF029, PGH003
+# ruff: noqa: PLR0913, PLR0917, PLR0914, PLW0717, PLR2004, RUF029
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import contextlib
 import html
 import json
 import os
@@ -12,13 +14,16 @@ import time
 import traceback
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NotRequired, Self, TypedDict
+from typing import TYPE_CHECKING, Any, Callable, NotRequired, Self, TypedDict
 
 import dotenv
 import googleapiclient.discovery
+import requests
 import yt_dlp
 from discord import Intents, Message, TextChannel
 from discord.ext import commands
+from mutagen.flac import Picture
+from mutagen.oggopus import OggOpus
 from spotipy import Spotify
 from spotipy.oauth2 import SpotifyOAuth
 
@@ -427,12 +432,16 @@ bot = commands.Bot(command_prefix=".", intents=Intents.all())
 
 pending_downloads: dict[int, dict[str, Any]] = {}
 pending_lock = threading.Lock()
+PICKER_CANCELLED = object()
 
 
 class DownloadJob(TypedDict):
     youtube_url: str
     display_name: str
     track: SeenSpotifyTrack | None
+
+
+StatusCallback = Callable[[str], None]
 
 
 @bot.event
@@ -550,6 +559,9 @@ def send_picker_and_wait(
             return None
 
     selected = selected_url_ref[0]
+    if selected == PICKER_CANCELLED:
+        return None
+
     with pending_lock:
         if message_id is not None and message_id in pending_downloads:
             del pending_downloads[message_id]
@@ -591,6 +603,17 @@ def queue_download_job(
         download_event.set()
 
 
+async def cancel_picker(data: dict[str, Any], message: Message) -> None:
+    selected_url_ref = data["selected_url_ref"]
+    selected_url_ref[0] = PICKER_CANCELLED
+    await message.channel.send("❌ Picker was cancelled.")
+
+
+async def re_register_picker(prompt_message_id: int, data: dict[str, Any]) -> None:
+    with pending_lock:
+        pending_downloads[prompt_message_id] = data
+
+
 async def handle_user_reply(message: Message, prompt_message_id: int) -> None:
     with pending_lock:
         if prompt_message_id not in pending_downloads:
@@ -600,8 +623,13 @@ async def handle_user_reply(message: Message, prompt_message_id: int) -> None:
         results = data["results"]
         selected_url_ref = data["selected_url_ref"]
 
+    content = message.content.strip()
+    if content.lower() == "cancel":
+        await cancel_picker(data, message)
+        return
+
     try:
-        choice = int(message.content.strip())
+        choice = int(content)
         if 1 <= choice <= len(results):
             selected = results[choice - 1]
             print(f"[{time.strftime('%H:%M:%S')}] User selected: {selected['title']}")
@@ -611,10 +639,9 @@ async def handle_user_reply(message: Message, prompt_message_id: int) -> None:
         else:
             await message.reply("Invalid choice. Please reply with a number between 1 and 8, or paste a YouTube URL.")
             selected_url_ref[0] = None
-            with pending_lock:
-                pending_downloads[prompt_message_id] = data
+            await re_register_picker(prompt_message_id, data)
     except ValueError:
-        url = message.content.strip()
+        url = content
         if is_youtube_url(url):
             print(f"[{time.strftime('%H:%M:%S')}] User selected custom URL: {url}")
             selected_url_ref[0] = url
@@ -622,8 +649,7 @@ async def handle_user_reply(message: Message, prompt_message_id: int) -> None:
         else:
             await message.reply("Invalid input. Please reply with the number of the item you'd like to select, or paste a YouTube URL.")  # noqa: E501
             selected_url_ref[0] = None
-            with pending_lock:
-                pending_downloads[prompt_message_id] = data
+            await re_register_picker(prompt_message_id, data)
 
 
 @bot.command(name="download")
@@ -820,29 +846,196 @@ def save_to_downloaded_json(track: SeenSpotifyTrack) -> None:
         json.dump(data, f, indent=4)
 
 
-def download_track(youtube_url: str, display_name: str, max_retries: int = 3) -> bool:
+def get_largest_album_image(track: SpotifyTrack) -> SpotifyImage | None:
+    if not track.album.images:
+        return None
+    return max(track.album.images, key=lambda image: image.width * image.height)
+
+
+def download_album_art(image: SpotifyImage) -> tuple[bytes, str] | None:
+    try:
+        response = requests.get(image.url, timeout=20)
+        response.raise_for_status()
+    except requests.RequestException as e:
+        print(f"[WARN] Failed to download album art: {e}")
+        return None
+
+    content_type = response.headers.get("Content-Type", "").split(";")[0].strip()
+    if content_type not in {"image/jpeg", "image/png"}:
+        if response.content.startswith(b"\xff\xd8\xff"):
+            content_type = "image/jpeg"
+        elif response.content.startswith(b"\x89PNG\r\n\x1a\n"):
+            content_type = "image/png"
+        else:
+            print(f"[WARN] Unsupported album art content type: {content_type or 'unknown'}")
+            return None
+
+    return response.content, content_type
+
+
+def build_track_number(track: SpotifyTrack) -> str:
+    total_tracks = track.album.total_tracks
+    if total_tracks > 0:
+        return f"{track.track_number}/{total_tracks}"
+    return str(track.track_number)
+
+
+def truncate_status_text(value: str, max_length: int = 300) -> str:
+    if len(value) <= max_length:
+        return value
+    return f"{value[:max_length - 3]}..."
+
+
+def tag_opus_file(path: Path, track: SeenSpotifyTrack) -> None:
+    audio = OggOpus(path)
+    spotify_track = track.item
+    album = spotify_track.album
+    artists = [artist.name for artist in spotify_track.artists]
+    album_artists = [artist.name for artist in album.artists]
+
+    audio.clear()
+    audio["title"] = [spotify_track.name]
+    audio["artist"] = artists
+    audio["album"] = [album.name]
+    audio["albumartist"] = album_artists
+    audio["date"] = [album.release_date]
+    audio["tracknumber"] = [build_track_number(spotify_track)]
+    audio["discnumber"] = [str(spotify_track.disc_number)]
+    audio["organization"] = ["Spotify"]
+    audio["website"] = [spotify_track.external_urls.spotify]
+    audio["comment"] = [f"Spotify URL: {spotify_track.external_urls.spotify}"]
+    audio["spotify_track_id"] = [spotify_track.id]
+    audio["spotify_album_id"] = [album.id]
+    audio["spotify_artist_ids"] = [", ".join(artist.id for artist in spotify_track.artists)]
+    audio["explicit"] = ["1" if spotify_track.explicit else "0"]
+
+    image = get_largest_album_image(spotify_track)
+    if image is not None:
+        album_art = download_album_art(image)
+        if album_art is not None:
+            image_data, mime_type = album_art
+            picture = Picture()
+            picture.type = 3
+            picture.mime = mime_type
+            picture.desc = "Cover"
+            picture.data = image_data
+            audio["metadata_block_picture"] = [
+                base64.b64encode(picture.write()).decode("ascii"),
+            ]
+
+    audio.save()
+
+
+def tag_downloaded_file(path: Path, track: SeenSpotifyTrack | None) -> str | None:
+    if track is None:
+        return "ℹ️ Skipped metadata tags because this download was not matched to Spotify."
+
+    if path.suffix.lower() != ".opus":
+        message = f"⚠️ Skipped metadata tags for unsupported file type: `{path.name}`"
+        print(f"[WARN] Skipping metadata tagging for unsupported file type: {path.name}")
+        return message
+
+    try:
+        tag_opus_file(path, track)
+        print(f"[{time.strftime('%H:%M:%S')}] Tagged: {path.name}")
+        return f"🏷️ Tagged `{path.name}` with Spotify metadata and album art."
+    except Exception as e:
+        print(f"[WARN] Failed to tag {path.name}: {e}")
+        return f"⚠️ Downloaded `{path.name}`, but metadata tagging failed: `{truncate_status_text(str(e))}`"
+
+
+def download_track(
+    youtube_url: str,
+    display_name: str,
+    track: SeenSpotifyTrack | None = None,
+    status_callback: StatusCallback | None = None,
+    max_retries: int = 3,
+) -> bool:
     for attempt in range(max_retries):
         try:
             print(f"[{time.strftime('%H:%M:%S')}] Downloading: {display_name}")
-            yt_dlp.YoutubeDL({
+            with yt_dlp.YoutubeDL({
                 "outtmpl": str(DOWNLOADS.resolve() / "%(title)s.%(ext)s"),
                 "format": "bestaudio[ext=opus]/bestaudio/best",
                 "postprocessors": [{
                     "key": "FFmpegExtractAudio",
                     "preferredcodec": "opus",
                 }],
-            }).download([youtube_url])
+            }) as ydl:
+                info = ydl.extract_info(youtube_url, download=True)
+                downloaded_path = Path(ydl.prepare_filename(info)).with_suffix(".opus")
+
+            if downloaded_path.exists():
+                tag_status = tag_downloaded_file(downloaded_path, track)
+                if tag_status is not None and status_callback is not None:
+                    status_callback(tag_status)
+            else:
+                warning = f"Download succeeded but output file was not found: {downloaded_path}"
+                print(f"[WARN] {warning}")
+                if status_callback is not None:
+                    status_callback(f"⚠️ {warning}")
+
             print(f"[{time.strftime('%H:%M:%S')}] Downloaded: {display_name}")
             return True
         except Exception as e:
             error_msg = str(e)
             if "403" in error_msg or "Forbidden" in error_msg:  # noqa: SIM102
                 if attempt < max_retries - 1:
-                    print(f"[{time.strftime('%H:%M:%S')}] 403 Forbidden error, retrying in 60 seconds (attempt {attempt + 1}/{max_retries})")  # noqa: E501
+                    retry_message = (
+                        "403 Forbidden error, retrying in 60 seconds "
+                        f"(attempt {attempt + 1}/{max_retries})"
+                    )
+                    print(f"[{time.strftime('%H:%M:%S')}] {retry_message}")
+                    if status_callback is not None:
+                        status_callback(f"⚠️ {retry_message}")
                     time.sleep(60)
                     continue
+            if status_callback is not None:
+                status_callback(
+                    f"⚠️ Download attempt failed for {display_name}: "
+                    f"`{truncate_status_text(error_msg)}`",
+                )
             break
     return False
+
+
+def process_pending_selection(track: SeenSpotifyTrack, youtube_query: str) -> None:
+    channel = get_default_channel()
+    display_name = f"*{track.item.name}* by {track.item.artists[0].name}"
+
+    try:
+        if any(item.matches(track) for item in get_downloads_list()):
+            print(f"[{time.strftime('%H:%M:%S')}] Skipping already downloaded: {track.item.name}")
+            queue_download_status(channel, f"⏭️ Skipping {display_name}; it is already downloaded.")
+            return
+
+        print(f"[{time.strftime('%H:%M:%S')}] Searching YouTube for: {youtube_query}")
+        queue_download_status(channel, f"🔎 Searching YouTube for {display_name}...")
+        results = search_youtube(youtube_query, max_results=8)
+        if not results:
+            print(f"[{time.strftime('%H:%M:%S')}] No YouTube results found for: {track.item.name}")
+            queue_download_status(channel, f"❌ No YouTube results found for {display_name}.")
+            return
+
+        print(f"[{time.strftime('%H:%M:%S')}] Sending Discord message with {len(results)} options...")
+        selected_url = send_download_options(track, results)
+
+        if selected_url is None:
+            print(f"[{time.strftime('%H:%M:%S')}] No selection made for: {track.item.name}")
+            queue_download_status(channel, f"⌛ No selection was made for {display_name}.")
+            return
+
+        print(f"[{time.strftime('%H:%M:%S')}] User selected: {selected_url}")
+
+        queue_download_job(
+            youtube_url=selected_url,
+            display_name=display_name,
+            track=track,
+        )
+    finally:
+        with download_lock:
+            seen_tracks[:] = [(t, q) for t, q in seen_tracks if t is not track]
+            in_flight_track_ids.discard(track.item.id)
 
 
 def pending_selection_worker() -> None:
@@ -850,48 +1043,17 @@ def pending_selection_worker() -> None:
         pending_selection_event.wait()
         pending_selection_event.clear()
 
-        with pending_selection_lock:
-            if not pending_selection_queue:
-                continue
-            track, youtube_query = pending_selection_queue.pop(0)
+        while True:
+            with pending_selection_lock:
+                if not pending_selection_queue:
+                    break
+                track, youtube_query = pending_selection_queue.pop(0)
 
-        if any(item.matches(track) for item in get_downloads_list()):
-            print(f"[{time.strftime('%H:%M:%S')}] Skipping already downloaded: {track.item.name}")
-            with download_lock:
-                seen_tracks[:] = [(t, q) for t, q in seen_tracks if t is not track]
-                in_flight_track_ids.discard(track.item.id)
-            continue
-
-        print(f"[{time.strftime('%H:%M:%S')}] Searching YouTube for: {youtube_query}")
-        results = search_youtube(youtube_query, max_results=8)
-        if not results:
-            print(f"[{time.strftime('%H:%M:%S')}] No YouTube results found for: {track.item.name}")
-            with download_lock:
-                seen_tracks[:] = [(t, q) for t, q in seen_tracks if t is not track]
-                in_flight_track_ids.discard(track.item.id)
-            continue
-
-        print(f"[{time.strftime('%H:%M:%S')}] Sending Discord message with {len(results)} options...")
-        selected_url = send_download_options(track, results)
-
-        if selected_url is None:
-            print(f"[{time.strftime('%H:%M:%S')}] No selection made for: {track.item.name}")
-            with download_lock:
-                seen_tracks[:] = [(t, q) for t, q in seen_tracks if t is not track]
-                in_flight_track_ids.discard(track.item.id)
-            continue
-
-        print(f"[{time.strftime('%H:%M:%S')}] User selected: {selected_url}")
-
-        queue_download_job(
-            youtube_url=selected_url,
-            display_name=f"*{track.item.name}* by {track.item.artists[0].name}",
-            track=track,
-        )
-
-        with download_lock:
-            seen_tracks[:] = [(t, q) for t, q in seen_tracks if t is not track]
-            in_flight_track_ids.discard(track.item.id)
+            threading.Thread(
+                target=process_pending_selection,
+                args=(track, youtube_query),
+                daemon=True,
+            ).start()
 
 
 async def send_download_status(channel: TextChannel, message: str) -> None:
@@ -899,6 +1061,15 @@ async def send_download_status(channel: TextChannel, message: str) -> None:
         await channel.send(message)
     except Exception as e:
         print(f"[ERROR] Failed to send status message: {e}")
+
+
+def queue_download_status(channel: TextChannel | None, message: str) -> None:
+    if channel is None:
+        return
+    asyncio.run_coroutine_threadsafe(
+        send_download_status(channel, message),
+        bot.loop,
+    )
 
 
 def download_worker() -> None:
@@ -918,27 +1089,22 @@ def download_worker() -> None:
 
             channel = get_default_channel()
 
-            if channel:
-                asyncio.run_coroutine_threadsafe(
-                    send_download_status(channel, f"⬇️ Downloading {display_name}..."),
-                    bot.loop,
-                )
+            queue_download_status(channel, f"⬇️ Downloading {display_name}...")
 
-            success = download_track(youtube_url, display_name)
+            success = download_track(
+                youtube_url,
+                display_name,
+                track=track,
+                status_callback=lambda message: queue_download_status(channel, message),
+            )
 
             if channel:
                 if success:
                     if track is not None:
                         save_to_downloaded_json(track)
-                    asyncio.run_coroutine_threadsafe(
-                        send_download_status(channel, f"✅ Downloaded {display_name}!"),
-                        bot.loop,
-                    )
+                    queue_download_status(channel, f"✅ Finished processing {display_name}!")
                 else:
-                    asyncio.run_coroutine_threadsafe(
-                        send_download_status(channel, f"❌ Failed to download {display_name}"),
-                        bot.loop,
-                    )
+                    queue_download_status(channel, f"❌ Failed to download {display_name}")
             else:  # noqa: PLR5501
                 if success:
                     if track is not None:
