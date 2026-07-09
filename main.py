@@ -418,6 +418,7 @@ SPOTIFY_SECRET = os.getenv("SPOTIFY_SECRET")
 TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 SERVER_ID = os.getenv("DISCORD_SERVER_ID", "")
 CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID", "")
+PING = os.getenv("DISCORD_PING", "")
 
 bot = commands.Bot(command_prefix=".", intents=Intents.all())
 
@@ -450,7 +451,7 @@ def send_download_options(
 ) -> str | None:
     channel: TextChannel = bot.get_guild(int(SERVER_ID)).get_channel(int(CHANNEL_ID))  # type: ignore  # noqa: PGH003
 
-    prompt = f"Found {len(results)} matches for *{track.item.name}* by {track.item.artists[0].name}:\n\n"
+    prompt = f"{PING} Found {len(results)} matches for *{track.item.name}* by {track.item.artists[0].name}:\n\n"
     for i, result in enumerate(results, 1):
         title = result["title"]
         title = title[:100] if len(title) > 100 else title  # noqa: PLR2004
