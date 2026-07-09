@@ -15,7 +15,7 @@ import dotenv
 import googleapiclient.discovery
 import yt_dlp
 from discord import Intents, Message, TextChannel
-from discord.ext import commands, tasks
+from discord.ext import commands
 from spotipy import Spotify
 from spotipy.oauth2 import SpotifyOAuth
 
@@ -428,7 +428,6 @@ pending_lock = threading.Lock()
 @bot.event
 async def on_ready() -> None:  # noqa: RUF029
     print(f"Bot logged in as {bot.user}")
-    download_checker.start()
 
 
 @bot.event
@@ -443,16 +442,6 @@ async def on_message(message: Message) -> None:
         await handle_user_reply(message, message.reference.message_id)
 
     await bot.process_commands(message)
-
-
-@tasks.loop(seconds=5)
-async def download_checker() -> None:
-    pass
-
-
-@download_checker.before_loop
-async def before_download_checker() -> None:
-    await bot.wait_until_ready()
 
 
 def send_download_options(
@@ -489,8 +478,6 @@ def send_download_options(
         print(f"Error sending download options: {e}")
         return None
 
-    save_to_downloaded_json(track)
-
     timeout = 60 * 15
     start_time = time.time()
 
@@ -498,7 +485,6 @@ def send_download_options(
         time.sleep(1)
         if time.time() - start_time > timeout:
             print("Timeout waiting for user selection")
-            remove_from_downloaded_json(track)
             with pending_lock:
                 to_remove = [
                     mid for mid, data in pending_downloads.items()
@@ -601,6 +587,7 @@ pending_selection_event = threading.Event()
 download_queue: list[tuple[SeenSpotifyTrack, str]] = []
 download_lock = threading.Lock()
 download_event = threading.Event()
+in_flight_track_ids: set[str] = set()
 
 
 def get_downloads_list() -> list[DownloadsListItem]:
@@ -633,17 +620,6 @@ def save_to_downloaded_json(track: SeenSpotifyTrack) -> None:
         json.dump(data, f, indent=4)
 
 
-def remove_from_downloaded_json(track: SeenSpotifyTrack) -> None:
-    with DOWNLOADS_LIST.open("r") as f:
-        data: list[dict[str, str | int]] = json.load(f)
-
-    with DOWNLOADS_LIST.open("w") as f:
-        json.dump([item for item in data if (
-            f"{item['name']}_{item['artist']}_{item['album']}".strip().lower() !=
-            f"{track.item.name}_{track.item.artists[0].name}_{track.item.album.name}".strip().lower()
-        )], f, indent=4)
-
-
 def download_track(track: SeenSpotifyTrack, youtube_url: str) -> bool:
     print(f"[{time.strftime('%H:%M:%S')}] Downloading: {track.item.name} by {track.item.artists[0].name}")
     yt_dlp.YoutubeDL({
@@ -672,6 +648,7 @@ def pending_selection_worker() -> None:
             print(f"[{time.strftime('%H:%M:%S')}] Skipping already downloaded: {track.item.name}")
             with download_lock:
                 seen_tracks[:] = [(t, q) for t, q in seen_tracks if t is not track]
+                in_flight_track_ids.discard(track.item.id)
             continue
 
         print(f"[{time.strftime('%H:%M:%S')}] Searching YouTube for: {youtube_query}")
@@ -680,6 +657,7 @@ def pending_selection_worker() -> None:
             print(f"[{time.strftime('%H:%M:%S')}] No YouTube results found for: {track.item.name}")
             with download_lock:
                 seen_tracks[:] = [(t, q) for t, q in seen_tracks if t is not track]
+                in_flight_track_ids.discard(track.item.id)
             continue
 
         print(f"[{time.strftime('%H:%M:%S')}] Sending Discord message with {len(results)} options...")
@@ -689,6 +667,7 @@ def pending_selection_worker() -> None:
             print(f"[{time.strftime('%H:%M:%S')}] No selection made for: {track.item.name}")
             with download_lock:
                 seen_tracks[:] = [(t, q) for t, q in seen_tracks if t is not track]
+                in_flight_track_ids.discard(track.item.id)
             continue
 
         print(f"[{time.strftime('%H:%M:%S')}] User selected: {selected_url}")
@@ -699,6 +678,7 @@ def pending_selection_worker() -> None:
 
         with download_lock:
             seen_tracks[:] = [(t, q) for t, q in seen_tracks if t is not track]
+            in_flight_track_ids.discard(track.item.id)
 
 
 def download_worker() -> None:
@@ -714,10 +694,9 @@ def download_worker() -> None:
         success = download_track(track, youtube_url)
 
         if success:
-            pass
+            save_to_downloaded_json(track)
         else:
             print(f"[{time.strftime('%H:%M:%S')}] Failed to download: {track.item.name}")
-            remove_from_downloaded_json(track)
 
 
 def queue_download(track: SeenSpotifyTrack, youtube_query: str) -> None:
@@ -741,20 +720,44 @@ pending_thread.start()
 
 seen_tracks: list[tuple[SeenSpotifyTrack, str]] = []
 
+last_seen_track_id: str | None = None
+
 
 while True:
     print()
 
-    raw = spotify.current_user_playing_track()
+    try:
+        raw = spotify.current_user_playing_track()
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch currently playing track: {e}")
+        time.sleep(30)
+        continue
+
     if not raw:
         intr = 30
         print(f"No track currently playing. Checking again in {intr}s...")
+        last_seen_track_id = None
         time.sleep(intr)
         continue
 
     track = SeenSpotifyTrack.from_dict(raw)
+
+    with download_lock:
+        already_in_flight = track.item.id in in_flight_track_ids
+
+    if track.item.id == last_seen_track_id or already_in_flight:
+        print(
+            f"[{time.strftime('%H:%M:%S')}] Skipping (already in flight or unchanged): "
+            f"{track.item.name} by {track.item.artists[0].name}",
+        )
+        time.sleep(15)
+        continue
+
+    last_seen_track_id = track.item.id
     youtube_query = make_youtube_query(track)
-    seen_tracks.append((track, youtube_query))
+    with download_lock:
+        seen_tracks.append((track, youtube_query))
+        in_flight_track_ids.add(track.item.id)
 
     queue_download(track, youtube_query)
 
