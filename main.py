@@ -524,14 +524,14 @@ def build_download_picker_prompt(
                 duration_line = f"\n   - Song Length: {yt_duration}"
             else:
                 diff_ms = duration_ms - spotify_duration_ms
-                if diff_ms > 0:
+                if abs(diff_ms) <= 999:
+                    duration_line = f"\n   - Song Length: {yt_duration} (Same length as Spotify)"
+                elif diff_ms > 0:
                     diff_formatted = format_duration(diff_ms)
                     duration_line = f"\n   - Song Length: {yt_duration} (+{diff_formatted} longer than Spotify)"
-                elif diff_ms < 0:
+                else:
                     diff_formatted = format_duration(abs(diff_ms))
                     duration_line = f"\n   - Song Length: {yt_duration} (-{diff_formatted} shorter than Spotify)"
-                else:
-                    duration_line = f"\n   - Song Length: {yt_duration} (Same length as Spotify)"
 
         prompt += f"{i}. [{title}](<{result['url']}>)\n{channel_line}{duration_line}\n"
     prompt += "Reply with the best option or a YouTube URL:"
@@ -1073,7 +1073,6 @@ def process_pending_selection(track: SeenSpotifyTrack, youtube_query: str) -> No
     try:
         if any(item.matches(track) for item in get_downloads_list()):
             print(f"[{time.strftime('%H:%M:%S')}] Skipping already downloaded: {track.item.name}")
-            queue_download_status(channel, f"⏭️ Skipping {display_name}; it is already downloaded.")
             return
 
         print(f"[{time.strftime('%H:%M:%S')}] Searching YouTube for: {youtube_query}")
