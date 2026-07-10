@@ -8,6 +8,7 @@ import html
 import json
 import os
 import re
+import signal
 import threading
 import time
 import traceback
@@ -436,6 +437,7 @@ bot = commands.Bot(command_prefix=".", intents=Intents.all())
 pending_downloads: dict[int, dict[str, Any]] = {}
 pending_lock = threading.Lock()
 PICKER_CANCELLED = object()
+shutdown_event = threading.Event()
 bot_thread_id: int | None = None
 
 
@@ -451,6 +453,10 @@ StatusCallback = Callable[[str], None]
 @bot.event
 async def on_ready() -> None:
     print(f"Bot logged in as {bot.user}")
+
+
+def sleep_until_shutdown(seconds: float) -> bool:
+    return shutdown_event.wait(seconds)
 
 
 @bot.event
@@ -526,7 +532,7 @@ def build_download_picker_prompt(
     return prompt
 
 
-def send_picker_and_wait(
+def send_picker_and_wait(  # noqa: C901
     channel: TextChannel,
     prompt: str,
     results: list[dict[str, Any]],
@@ -561,14 +567,20 @@ def send_picker_and_wait(
     timeout = 60 * 15
     start_time = time.time()
 
-    while selected_url_ref[0] is None:
-        time.sleep(1)
+    while selected_url_ref[0] is None and not shutdown_event.is_set():
+        sleep_until_shutdown(1)
         if time.time() - start_time > timeout:
             print("Timeout waiting for user selection")
             with pending_lock:
                 if message_id is not None and message_id in pending_downloads:
                     del pending_downloads[message_id]
             return None
+
+    if shutdown_event.is_set():
+        with pending_lock:
+            if message_id is not None and message_id in pending_downloads:
+                del pending_downloads[message_id]
+        return None
 
     selected = selected_url_ref[0]
     if selected == PICKER_CANCELLED:
@@ -710,9 +722,45 @@ async def download_command(ctx: commands.Context[commands.Bot], *, query_or_url:
 
 
 def run_bot() -> None:
-    global bot_thread_id
+    global bot_thread_id  # noqa: PLW0603
     bot_thread_id = threading.get_ident()
     bot.run(TOKEN)
+
+
+def request_bot_close() -> None:
+    if bot.is_closed():
+        return
+
+    try:
+        future = asyncio.run_coroutine_threadsafe(bot.close(), bot.loop)
+        future.result(timeout=10)
+    except TimeoutError:
+        print("[WARN] Timed out while closing Discord bot.")
+    except Exception as e:
+        print(f"[WARN] Error while closing Discord bot: {e}")
+
+
+def shutdown() -> None:
+    if shutdown_event.is_set():
+        return
+
+    print("\nShutting down...")
+    shutdown_event.set()
+    download_event.set()
+    pending_selection_event.set()
+
+    if bot.is_ready() and not bot.is_closed():
+        try:
+            future = asyncio.run_coroutine_threadsafe(set_listening_status(None), bot.loop)
+            future.result(timeout=5)
+        except Exception as e:
+            print(f"[WARN] Failed to clear listening status: {e}")
+    request_bot_close()
+
+
+def handle_shutdown_signal(signum: int, _frame: Any) -> None:  # noqa: ANN401
+    print(f"\nReceived signal {signum}.")
+    shutdown()
 
 
 spotify_oauth = SpotifyOAuth(
@@ -941,7 +989,7 @@ def tag_opus_file(path: Path, track: SeenSpotifyTrack) -> None:
 
 def tag_downloaded_file(path: Path, track: SeenSpotifyTrack | None) -> str | None:
     if track is None:
-        return "ℹ️ Skipped metadata tags because this download was not matched to Spotify."
+        return "ℹ️ Skipped metadata tags because this download was not matched to Spotify."  # noqa: RUF001
 
     if path.suffix.lower() != ".opus":
         message = f"⚠️ Skipped metadata tags for unsupported file type: `{path.name}`"
@@ -957,7 +1005,7 @@ def tag_downloaded_file(path: Path, track: SeenSpotifyTrack | None) -> str | Non
         return f"⚠️ Downloaded `{path.name}`, but metadata tagging failed: `{truncate_status_text(str(e))}`"
 
 
-def download_track(
+def download_track(  # noqa: C901
     youtube_url: str,
     display_name: str,
     track: SeenSpotifyTrack | None = None,
@@ -1001,7 +1049,8 @@ def download_track(
                     print(f"[{time.strftime('%H:%M:%S')}] {retry_message}")
                     if status_callback is not None:
                         status_callback(f"⚠️ {retry_message}")
-                    time.sleep(60)
+                    if sleep_until_shutdown(60):
+                        return False
                     continue
             if status_callback is not None:
                 status_callback(
@@ -1052,8 +1101,10 @@ def process_pending_selection(track: SeenSpotifyTrack, youtube_query: str) -> No
 
 
 def pending_selection_worker() -> None:
-    while True:
-        pending_selection_event.wait()
+    while not shutdown_event.is_set():
+        pending_selection_event.wait(1)
+        if shutdown_event.is_set():
+            break
         pending_selection_event.clear()
 
         while True:
@@ -1125,9 +1176,11 @@ def queue_download_status(channel: TextChannel | None, message: str) -> None:
 
 
 def download_worker() -> None:
-    while True:
+    while not shutdown_event.is_set():
         try:
-            download_event.wait()
+            download_event.wait(1)
+            if shutdown_event.is_set():
+                break
             download_event.clear()
 
             with download_lock:
@@ -1147,7 +1200,7 @@ def download_worker() -> None:
                 youtube_url,
                 display_name,
                 track=track,
-                status_callback=lambda message: queue_download_status(channel, message),
+                status_callback=lambda message: queue_download_status(channel, message),  # noqa: B023
             )
 
             if channel:
@@ -1166,7 +1219,7 @@ def download_worker() -> None:
         except Exception as e:
             print(f"[{time.strftime('%H:%M:%S')}] Download worker error: {e}")
             traceback.print_exc()
-            time.sleep(1)
+            sleep_until_shutdown(1)
 
 
 def queue_download(track: SeenSpotifyTrack, youtube_query: str) -> None:
@@ -1175,18 +1228,22 @@ def queue_download(track: SeenSpotifyTrack, youtube_query: str) -> None:
     pending_selection_event.set()
 
 
+signal.signal(signal.SIGINT, handle_shutdown_signal)
+signal.signal(signal.SIGTERM, handle_shutdown_signal)
+
 print("Starting Discord bot...")
-bot_thread = threading.Thread(target=run_bot, daemon=True)
+bot_thread = threading.Thread(target=run_bot)
 bot_thread.start()
 
-while not bot.is_ready():
-    time.sleep(0.5)
+while not bot.is_ready() and not shutdown_event.is_set():
+    sleep_until_shutdown(0.5)
 
-download_thread = threading.Thread(target=download_worker, daemon=True)
-download_thread.start()
+download_thread = threading.Thread(target=download_worker)
+pending_thread = threading.Thread(target=pending_selection_worker)
 
-pending_thread = threading.Thread(target=pending_selection_worker, daemon=True)
-pending_thread.start()
+if not shutdown_event.is_set():
+    download_thread.start()
+    pending_thread.start()
 
 seen_tracks: list[tuple[SeenSpotifyTrack, str]] = []
 
@@ -1194,15 +1251,18 @@ last_seen_track_id: str | None = None
 current_presence_track_id: str | None = None
 
 
-while True:
+while not shutdown_event.is_set():
     print()
 
     try:
         raw = spotify.current_user_playing_track()
     except Exception as e:
         print(f"[ERROR] Failed to fetch currently playing track: {e}")
-        time.sleep(30)
+        sleep_until_shutdown(30)
         continue
+
+    if shutdown_event.is_set():
+        break
 
     if not raw or not raw.get("is_playing"):
         intr = 30
@@ -1211,7 +1271,7 @@ while True:
         if current_presence_track_id is not None:
             queue_listening_status_update(None)
             current_presence_track_id = None
-        time.sleep(intr)
+        sleep_until_shutdown(intr)
         continue
 
     track = SeenSpotifyTrack.from_dict(raw)
@@ -1228,7 +1288,7 @@ while True:
             f"[{time.strftime('%H:%M:%S')}] Skipping (already in flight or unchanged): "
             f"{track.item.name} by {track.item.artists[0].name}",
         )
-        time.sleep(POLLING_INTERVAL)
+        sleep_until_shutdown(POLLING_INTERVAL)
         continue
 
     last_seen_track_id = track.item.id
@@ -1244,4 +1304,11 @@ while True:
         f"on {track.item.album.name} ({track.item.external_urls.spotify})",
     )
 
-    time.sleep(POLLING_INTERVAL)
+    sleep_until_shutdown(POLLING_INTERVAL)
+
+shutdown()
+for thread in (download_thread, pending_thread, bot_thread):
+    if thread.is_alive():
+        thread.join(timeout=5)
+
+print("Shutdown complete.")
