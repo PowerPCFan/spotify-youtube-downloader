@@ -23,6 +23,7 @@ import requests
 import yt_dlp
 from discord import Activity, ActivityType, Intents, Message, TextChannel
 from discord.ext import commands
+from discord.utils import escape_markdown
 from mutagen.flac import Picture
 from mutagen.oggopus import OggOpus
 from spotipy import Spotify
@@ -486,11 +487,16 @@ def is_youtube_url(value: str) -> bool:
 
 
 def sanitize_for_hyperlink(text: str) -> str:
-    allowed_re = re.compile(
-        r"[a-zA-Z0-9\s-.,'\"!@#$%^&*()_+=:;?<>/|`~]",
-        re.UNICODE | re.IGNORECASE | re.MULTILINE,
+    allowed = set("-.,'\"!@#$%^&*()_+=:;?<>/|`~")
+    return escape_markdown(
+        " ".join("".join(
+            ch for ch in text
+            if ch.isalnum()
+            or ch.isspace()
+            or ch in allowed
+        ).split()),
+        as_needed=True,
     )
-    return "".join(ch for ch in text if allowed_re.match(ch))
 
 
 def build_download_picker_prompt(
@@ -758,8 +764,7 @@ def shutdown() -> None:
     request_bot_close()
 
 
-def handle_shutdown_signal(signum: int, _frame: Any) -> None:  # noqa: ANN401
-    print(f"\nReceived signal {signum}.")
+def handle_shutdown_signal(_signum: int, _frame: Any) -> None:  # noqa: ANN401
     shutdown()
 
 
@@ -1310,5 +1315,3 @@ shutdown()
 for thread in (download_thread, pending_thread, bot_thread):
     if thread.is_alive():
         thread.join(timeout=5)
-
-print("Shutdown complete.")
