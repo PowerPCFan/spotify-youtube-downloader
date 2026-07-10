@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import contextlib
 import html
 import json
 import os
@@ -12,15 +11,16 @@ import re
 import threading
 import time
 import traceback
+from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, NotRequired, Self, TypedDict
+from typing import TYPE_CHECKING, Any, NotRequired, Self, TypedDict
 
 import dotenv
 import googleapiclient.discovery
 import requests
 import yt_dlp
-from discord import Intents, Message, TextChannel
+from discord import Activity, ActivityType, Intents, Message, TextChannel
 from discord.ext import commands
 from mutagen.flac import Picture
 from mutagen.oggopus import OggOpus
@@ -29,6 +29,9 @@ from spotipy.oauth2 import SpotifyOAuth
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+
+
+POLLING_INTERVAL = 15
 
 
 class SpotifyObjectType(StrEnum):
@@ -433,6 +436,7 @@ bot = commands.Bot(command_prefix=".", intents=Intents.all())
 pending_downloads: dict[int, dict[str, Any]] = {}
 pending_lock = threading.Lock()
 PICKER_CANCELLED = object()
+bot_thread_id: int | None = None
 
 
 class DownloadJob(TypedDict):
@@ -475,6 +479,14 @@ def is_youtube_url(value: str) -> bool:
     return "youtube.com/watch?v=" in value or "youtu.be/" in value
 
 
+def sanitize_for_hyperlink(text: str) -> str:
+    allowed_re = re.compile(
+        r"[a-zA-Z0-9\s-.,'\"!@#$%^&*()_+=:;?<>/|`~]",
+        re.UNICODE | re.IGNORECASE | re.MULTILINE,
+    )
+    return "".join(ch for ch in text if allowed_re.match(ch))
+
+
 def build_download_picker_prompt(
     intro_line: str,
     results: list[dict[str, Any]],
@@ -482,7 +494,7 @@ def build_download_picker_prompt(
 ) -> str:
     prompt = f"{intro_line}\n\n"
     for i, result in enumerate(results, 1):
-        title = html.unescape(result["title"])
+        title = sanitize_for_hyperlink(html.unescape(result["title"]))
         title = title[:100] if len(title) > 100 else title
         channel_name = result["channel"]
         channel_info = result.get("channel_info")
@@ -633,9 +645,8 @@ async def handle_user_reply(message: Message, prompt_message_id: int) -> None:
         if 1 <= choice <= len(results):
             selected = results[choice - 1]
             print(f"[{time.strftime('%H:%M:%S')}] User selected: {selected['title']}")
-            selected_url_ref[0] = selected["url"]
-            # Acknowledge the selection
             await message.reply(f"Selected *{selected['title']}*, download starting!")
+            selected_url_ref[0] = selected["url"]
         else:
             await message.reply("Invalid choice. Please reply with a number between 1 and 8, or paste a YouTube URL.")
             selected_url_ref[0] = None
@@ -644,8 +655,8 @@ async def handle_user_reply(message: Message, prompt_message_id: int) -> None:
         url = content
         if is_youtube_url(url):
             print(f"[{time.strftime('%H:%M:%S')}] User selected custom URL: {url}")
-            selected_url_ref[0] = url
             await message.reply("Selected custom URL, download starting!")
+            selected_url_ref[0] = url
         else:
             await message.reply("Invalid input. Please reply with the number of the item you'd like to select, or paste a YouTube URL.")  # noqa: E501
             selected_url_ref[0] = None
@@ -699,6 +710,8 @@ async def download_command(ctx: commands.Context[commands.Bot], *, query_or_url:
 
 
 def run_bot() -> None:
+    global bot_thread_id
+    bot_thread_id = threading.get_ident()
     bot.run(TOKEN)
 
 
@@ -1063,13 +1076,52 @@ async def send_download_status(channel: TextChannel, message: str) -> None:
         print(f"[ERROR] Failed to send status message: {e}")
 
 
+async def set_listening_status(track: SeenSpotifyTrack | None) -> None:
+    activity = None
+    if track is not None:
+        artists = ", ".join(artist.name for artist in track.item.artists)
+        activity = Activity(
+            type=ActivityType.listening,
+            name=truncate_status_text(f"{artists} - {track.item.name}", max_length=128),
+        )
+
+    await bot.change_presence(activity=activity)
+
+
+def log_presence_update_result(future: Any) -> None:  # noqa: ANN401
+    try:
+        future.result()
+    except Exception as e:
+        print(f"[ERROR] Failed to update listening status: {e}")
+
+
+def queue_listening_status_update(track: SeenSpotifyTrack | None) -> None:
+    if threading.get_ident() == bot_thread_id:
+        bot.loop.create_task(set_listening_status(track))
+        return
+
+    future = asyncio.run_coroutine_threadsafe(set_listening_status(track), bot.loop)
+    future.add_done_callback(log_presence_update_result)
+
+
 def queue_download_status(channel: TextChannel | None, message: str) -> None:
     if channel is None:
         return
-    asyncio.run_coroutine_threadsafe(
+
+    if threading.get_ident() == bot_thread_id:
+        bot.loop.create_task(send_download_status(channel, message))
+        return
+
+    future = asyncio.run_coroutine_threadsafe(
         send_download_status(channel, message),
         bot.loop,
     )
+    try:
+        future.result(timeout=5)
+    except TimeoutError:
+        print(f"[ERROR] Timed out sending status message: {message}")
+    except Exception as e:
+        print(f"[ERROR] Failed to queue status message: {e}")
 
 
 def download_worker() -> None:
@@ -1102,7 +1154,7 @@ def download_worker() -> None:
                 if success:
                     if track is not None:
                         save_to_downloaded_json(track)
-                    queue_download_status(channel, f"✅ Finished processing {display_name}!")
+                    queue_download_status(channel, f"✅ Finished {display_name}!")
                 else:
                     queue_download_status(channel, f"❌ Failed to download {display_name}")
             else:  # noqa: PLR5501
@@ -1139,6 +1191,7 @@ pending_thread.start()
 seen_tracks: list[tuple[SeenSpotifyTrack, str]] = []
 
 last_seen_track_id: str | None = None
+current_presence_track_id: str | None = None
 
 
 while True:
@@ -1151,14 +1204,21 @@ while True:
         time.sleep(30)
         continue
 
-    if not raw:
+    if not raw or not raw.get("is_playing"):
         intr = 30
         print(f"No track currently playing. Checking again in {intr}s...")
         last_seen_track_id = None
+        if current_presence_track_id is not None:
+            queue_listening_status_update(None)
+            current_presence_track_id = None
         time.sleep(intr)
         continue
 
     track = SeenSpotifyTrack.from_dict(raw)
+
+    if track.item.id != current_presence_track_id:
+        queue_listening_status_update(track)
+        current_presence_track_id = track.item.id
 
     with download_lock:
         already_in_flight = track.item.id in in_flight_track_ids
@@ -1168,7 +1228,7 @@ while True:
             f"[{time.strftime('%H:%M:%S')}] Skipping (already in flight or unchanged): "
             f"{track.item.name} by {track.item.artists[0].name}",
         )
-        time.sleep(15)
+        time.sleep(POLLING_INTERVAL)
         continue
 
     last_seen_track_id = track.item.id
@@ -1184,4 +1244,4 @@ while True:
         f"on {track.item.album.name} ({track.item.external_urls.spotify})",
     )
 
-    time.sleep(15)
+    time.sleep(POLLING_INTERVAL)
