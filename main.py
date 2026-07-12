@@ -1,4 +1,4 @@
-# ruff: noqa: PLR0913, PLR0917, PLR0914, PLW0717, PLR2004, RUF029
+# ruff: noqa: PLR0913, PLR0917, PLW0717, PLR2004, RUF029
 
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ from mutagen.flac import Picture
 from mutagen.oggopus import OggOpus
 from spotipy import Spotify
 from spotipy.oauth2 import SpotifyOAuth
+from ytmusicapi import YTMusic
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -419,6 +420,7 @@ PARENT = Path(__file__).parent
 ENV = PARENT / ".env"
 CACHE = PARENT / "spotify-cache.json"
 DOWNLOADS = PARENT / "downloads"
+DOWNLOADS.mkdir(exist_ok=True)
 DOWNLOADS_LIST = PARENT / "downloaded.json"
 if not DOWNLOADS_LIST.exists() or (DOWNLOADS_LIST.exists() and not DOWNLOADS_LIST.read_text().strip()):
     DOWNLOADS_LIST.write_text("[]")  # ensure its a list
@@ -505,7 +507,18 @@ def build_download_picker_prompt(
     spotify_duration_ms: int | None = None,
 ) -> str:
     prompt = f"{intro_line}\n\n"
+    last_source: str | None = None
     for i, result in enumerate(results, 1):
+        source = result.get("source", "youtube")
+        if source != last_source:
+            if last_source is not None:
+                prompt += "\n"
+            if source == "youtube_music":
+                prompt += "### YouTube Music\n"
+            else:
+                prompt += "### YouTube\n"
+            last_source = source
+
         title = sanitize_for_hyperlink(html.unescape(result["title"]))
         title = title[:100] if len(title) > 100 else title
         channel_name = result["channel"]
@@ -666,7 +679,10 @@ async def handle_user_reply(message: Message, prompt_message_id: int) -> None:
             await message.reply(f"Selected *{selected['title']}*, download starting!")
             selected_url_ref[0] = selected["url"]
         else:
-            await message.reply("Invalid choice. Please reply with a number between 1 and 8, or paste a YouTube URL.")
+            await message.reply(
+                f"Invalid choice. Please reply with a number between 1 and {len(results)}, "
+                "or paste a YouTube URL.",
+            )
             selected_url_ref[0] = None
             await re_register_picker(prompt_message_id, data)
     except ValueError:
@@ -701,8 +717,8 @@ async def download_command(ctx: commands.Context[commands.Bot], *, query_or_url:
         await ctx.reply("This command only works in a server text channel.")
         return
 
-    await ctx.reply(f"Searching YouTube for: *{query_or_url}*")
-    results = await asyncio.to_thread(search_youtube, query_or_url, 8)
+    await ctx.reply(f"Searching YouTube Music and YouTube for: *{query_or_url}*")
+    results = await asyncio.to_thread(search_download_options, query_or_url)
     if not results:
         await ctx.reply("No YouTube results found for that query.")
         return
@@ -783,6 +799,7 @@ youtube = googleapiclient.discovery.build(
     version="v3",
     developerKey=YOUTUBE_API_KEY,
 )
+yt_music = YTMusic()
 
 
 def make_youtube_query(track: SeenSpotifyTrack) -> str:
@@ -811,18 +828,35 @@ def format_duration(ms: int) -> str:
     return f"{minutes}:{seconds:02d}"
 
 
-def search_youtube(query: str, max_results: int) -> list[dict[str, Any]]:
+def parse_youtube_duration(duration_str: str) -> int | None:
+    pattern = re.compile(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?")
+    match = pattern.match(duration_str)
+    if not match:
+        return None
+
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2) or 0)
+    seconds = int(match.group(3) or 0)
+    return ((hours * 60 + minutes) * 60 + seconds) * 1000
+
+
+def get_youtube_video_metadata(video_ids: list[str]) -> dict[str, dict[str, Any]]:
+    if not video_ids:
+        return {}
+
     try:
-        request = youtube.search().list(
-            q=query,
-            part="id,snippet",
-            type="video",
-            maxResults=max_results,
+        video_request = youtube.videos().list(
+            part="snippet,contentDetails",
+            id=",".join(dict.fromkeys(video_ids)),
         )
-        response = request.execute()
+        video_response = video_request.execute()
+        videos = video_response.get("items", [])
 
-        channel_ids = list({item["snippet"]["channelId"] for item in response.get("items", [])})
-
+        channel_ids = list({
+            video["snippet"]["channelId"]
+            for video in videos
+            if video.get("snippet", {}).get("channelId")
+        })
         channel_info = {}
         if channel_ids:
             channel_request = youtube.channels().list(
@@ -836,40 +870,172 @@ def search_youtube(query: str, max_results: int) -> list[dict[str, Any]]:
                     "subscriber_count": int(channel["statistics"].get("subscriberCount", "0")),
                 }
 
+        return {
+            video["id"]: {
+                "channel": video["snippet"]["channelTitle"],
+                "channel_id": video["snippet"]["channelId"],
+                "channel_info": channel_info.get(video["snippet"]["channelId"]),
+                "duration_ms": parse_youtube_duration(video["contentDetails"]["duration"]),
+            }
+            for video in videos
+        }
+    except Exception as e:
+        print(f"[ERROR] YouTube video metadata lookup failed: {e}")
+        return {}
+
+
+def format_youtube_music_title(result: dict[str, Any]) -> str:
+    title = str(result.get("title", "Untitled"))
+    artists = [
+        str(artist["name"])
+        for artist in result.get("artists", [])
+        if artist.get("name")
+    ]
+    artist_text = ", ".join(artists)
+    if not artist_text or artist_text.lower() in title.lower():
+        return title
+    return f"{artist_text} - {title}"
+
+
+def build_video_result(
+    video_id: str,
+    title: str,
+    source: str,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    metadata = metadata or {}
+    return {
+        "id": video_id,
+        "title": title,
+        "channel": metadata.get("channel", "Unknown"),
+        "channel_id": metadata.get("channel_id"),
+        "url": f"https://youtube.com/watch?v={video_id}",
+        "channel_info": metadata.get("channel_info"),
+        "duration_ms": metadata.get("duration_ms"),
+        "source": source,
+    }
+
+
+def search_youtube_music(query: str) -> list[dict[str, Any]]:
+    try:
+        raw_results = yt_music.search(query)
+    except Exception as e:
+        print(f"[ERROR] YouTube Music search failed: {e}")
+        return []
+
+    atv_result = next(
+        (
+            result for result in raw_results
+            if result.get("videoId") and result.get("videoType") == "MUSIC_VIDEO_TYPE_ATV"
+        ),
+        None,
+    )
+    top_result = next((result for result in raw_results if result.get("videoId")), None)
+
+    selected_results = [result for result in (atv_result, top_result) if result is not None]
+    selected_video_ids = {
+        result["videoId"]
+        for result in selected_results
+        if result.get("videoId")
+    }
+    if len(selected_video_ids) < len(selected_results):
+        fallback_result = next(
+            (
+                result for result in raw_results
+                if result.get("videoId") and result["videoId"] not in selected_video_ids
+            ),
+            None,
+        )
+        if fallback_result is not None:
+            selected_results.append(fallback_result)
+
+    video_ids = [result["videoId"] for result in selected_results]
+    metadata = get_youtube_video_metadata(video_ids)
+
+    results = []
+    seen_video_ids = set()
+    for result in selected_results:
+        video_id = result["videoId"]
+        if video_id in seen_video_ids:
+            continue
+        seen_video_ids.add(video_id)
+        duration_ms = None
+        if result.get("duration_seconds") is not None:
+            duration_ms = int(result["duration_seconds"]) * 1000
+        video_metadata = metadata.get(video_id, {})
+        if duration_ms is not None:
+            video_metadata = {**video_metadata, "duration_ms": duration_ms}
+        results.append(build_video_result(
+            video_id=video_id,
+            title=format_youtube_music_title(result),
+            source="youtube_music",
+            metadata=video_metadata,
+        ))
+    return results
+
+
+def search_youtube(query: str, max_results: int) -> list[dict[str, Any]]:
+    try:
+        request = youtube.search().list(
+            q=query,
+            part="id,snippet",
+            type="video",
+            maxResults=max_results,
+        )
+        response = request.execute()
+
         video_ids = [item["id"]["videoId"] for item in response.get("items", [])]
-        video_duration_info = {}
-        if video_ids:
-            video_request = youtube.videos().list(
-                part="contentDetails",
-                id=",".join(video_ids),
-            )
-            video_response = video_request.execute()
-            for video in video_response.get("items", []):
-                duration_str = video["contentDetails"]["duration"]
-                pattern = re.compile(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?")
-                match = pattern.match(duration_str)
-                if match:
-                    hours = int(match.group(1) or 0)
-                    minutes = int(match.group(2) or 0)
-                    seconds = int(match.group(3) or 0)
-                    total_ms = ((hours * 60 + minutes) * 60 + seconds) * 1000
-                    video_duration_info[video["id"]] = total_ms
+        metadata = get_youtube_video_metadata(video_ids)
 
         return [
-            {
-                "id": item["id"]["videoId"],
-                "title": item["snippet"]["title"],
-                "channel": item["snippet"]["channelTitle"],
-                "channel_id": item["snippet"]["channelId"],
-                "url": f"https://youtube.com/watch?v={item['id']['videoId']}",
-                "channel_info": channel_info.get(item["snippet"]["channelId"]),
-                "duration_ms": video_duration_info.get(item["id"]["videoId"]),
-            }
+            build_video_result(
+                video_id=item["id"]["videoId"],
+                title=item["snippet"]["title"],
+                source="youtube",
+                metadata=metadata.get(item["id"]["videoId"]),
+            )
             for item in response.get("items", [])
         ]
     except Exception as e:
         print(f"[ERROR] YouTube search failed: {e}")
         return []
+
+
+def filter_duplicate_videos(
+    results: list[dict[str, Any]],
+    existing_video_ids: set[str],
+    limit: int,
+) -> list[dict[str, Any]]:
+    filtered_results = []
+    seen_video_ids = set(existing_video_ids)
+    for result in results:
+        video_id = result.get("id")
+        if video_id in seen_video_ids:
+            continue
+        if video_id:
+            seen_video_ids.add(video_id)
+        filtered_results.append(result)
+        if len(filtered_results) >= limit:
+            break
+    return filtered_results
+
+
+def search_download_options(query: str) -> list[dict[str, Any]]:
+    youtube_music_results = search_youtube_music(query)
+    youtube_music_video_ids = {
+        result["id"]
+        for result in youtube_music_results
+        if result.get("id")
+    }
+    youtube_results = filter_duplicate_videos(
+        search_youtube(query, max_results=8),
+        youtube_music_video_ids,
+        limit=6,
+    )
+    return [
+        *youtube_music_results,
+        *youtube_results,
+    ]
 
 
 pending_selection_queue: list[tuple[SeenSpotifyTrack, str]] = []
@@ -967,12 +1133,6 @@ def tag_opus_file(path: Path, track: SeenSpotifyTrack) -> None:
     audio["date"] = [album.release_date]
     audio["tracknumber"] = [build_track_number(spotify_track)]
     audio["discnumber"] = [str(spotify_track.disc_number)]
-    audio["organization"] = ["Spotify"]
-    audio["website"] = [spotify_track.external_urls.spotify]
-    audio["comment"] = [f"Spotify URL: {spotify_track.external_urls.spotify}"]
-    audio["spotify_track_id"] = [spotify_track.id]
-    audio["spotify_album_id"] = [album.id]
-    audio["spotify_artist_ids"] = [", ".join(artist.id for artist in spotify_track.artists)]
     audio["explicit"] = ["1" if spotify_track.explicit else "0"]
 
     image = get_largest_album_image(spotify_track)
@@ -985,9 +1145,7 @@ def tag_opus_file(path: Path, track: SeenSpotifyTrack) -> None:
             picture.mime = mime_type
             picture.desc = "Cover"
             picture.data = image_data
-            audio["metadata_block_picture"] = [
-                base64.b64encode(picture.write()).decode("ascii"),
-            ]
+            audio["metadata_block_picture"] = [base64.b64encode(picture.write()).decode("ascii")]
 
     audio.save()
 
@@ -1075,9 +1233,9 @@ def process_pending_selection(track: SeenSpotifyTrack, youtube_query: str) -> No
             print(f"[{time.strftime('%H:%M:%S')}] Skipping already downloaded: {track.item.name}")
             return
 
-        print(f"[{time.strftime('%H:%M:%S')}] Searching YouTube for: {youtube_query}")
-        queue_download_status(channel, f"🔎 Searching YouTube for {display_name}...")
-        results = search_youtube(youtube_query, max_results=8)
+        print(f"[{time.strftime('%H:%M:%S')}] Searching YouTube Music and YouTube for: {youtube_query}")
+        queue_download_status(channel, f"🔎 Searching YouTube Music and YouTube for {display_name}...")
+        results = search_download_options(youtube_query)
         if not results:
             print(f"[{time.strftime('%H:%M:%S')}] No YouTube results found for: {track.item.name}")
             queue_download_status(channel, f"❌ No YouTube results found for {display_name}.")

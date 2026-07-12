@@ -4,4 +4,7 @@ __pycache__/
 .env
 spotify-cache.json
 downloads/
+ytmusic/
 downloaded.json
+.agents/
+.codex/
